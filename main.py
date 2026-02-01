@@ -11,6 +11,7 @@ from app.api.routes.job_routes import router as job_router
 from app.core.config import settings
 from app.core.errors import AppError
 from app.core.logging import get_logger, setup_logging
+from app.jobs.job_repository import init_db
 from app.jobs.job_service import job_service
 from app.stt.whisper_engine import create_whisper_engine
 from app.summarize.llm_summarizer import create_llm_summarizer
@@ -35,6 +36,14 @@ async def lifespan(app: FastAPI):
     settings.JOB_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     settings.AUDIO_WORK_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("Storage directories initialized")
+
+    # Initialize database
+    await init_db()
+    logger.info("Database initialized")
+
+    # Initialize storage
+    await job_service.init_storage()
+    logger.info("Storage initialized")
 
     # Validate CUDA availability if requested
     if settings.DEVICE == "cuda" and not torch.cuda.is_available():

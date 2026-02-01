@@ -62,6 +62,9 @@ class Job(BaseModel):
     file_hash: str = Field(..., description="SHA-256 hash of uploaded file")
     original_filename: str = Field(..., description="Original uploaded filename")
     audio_path: str | None = Field(default=None, description="Path to processed audio file")
+    audio_object_key: str | None = Field(
+        default=None, description="Object storage key for original audio"
+    )
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     error: str | None = Field(default=None, description="Error message if failed")

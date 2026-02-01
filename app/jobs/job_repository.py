@@ -1,11 +1,11 @@
 """Job repository for data persistence."""
 
-import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-import aiofiles
+from sqlalchemy import JSON, DateTime, Integer, String, delete, select, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.core.config import settings
 from app.core.errors import JobNotFoundError, StorageError
@@ -15,21 +15,85 @@ from app.jobs.job_models import Job, JobStatus
 logger = get_logger(__name__)
 
 
-class JobRepository:
-    """Repository for job persistence using filesystem storage."""
+class Base(DeclarativeBase):
+    """Base for SQLAlchemy models."""
 
-    def __init__(self, storage_dir: Path | None = None) -> None:
+
+class JobRecord(Base):
+    """Database model for jobs."""
+
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default=JobStatus.QUEUED.value)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    audio_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    audio_object_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    metrics: Mapped[dict[str, float]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+async def init_db() -> None:
+    """Initialize database tables."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Lightweight migration: add audio_object_key if missing
+        result = await conn.execute(
+            text(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name='jobs' AND column_name='audio_object_key'
+                """
+            )
+        )
+        if result.scalar() is None:
+            await conn.execute(text("ALTER TABLE jobs ADD COLUMN audio_object_key VARCHAR(1024)"))
+
+
+class JobRepository:
+    """Repository for job persistence using PostgreSQL."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession] | None = None) -> None:
         """Initialize the job repository.
 
         Args:
-            storage_dir: Directory for job storage. Defaults to settings.JOB_STORAGE_DIR.
+            session_factory: SQLAlchemy async session factory.
         """
-        self.storage_dir = storage_dir or settings.JOB_STORAGE_DIR
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.session_factory = session_factory or SessionLocal
 
-    def _job_path(self, job_id: str) -> Path:
-        """Get the path to a job's JSON file."""
-        return self.storage_dir / f"{job_id}.json"
+    @staticmethod
+    def _to_job(record: JobRecord) -> Job:
+        """Convert a JobRecord to Job model."""
+        status_value = (
+            record.status.value if isinstance(record.status, JobStatus) else record.status
+        )
+        return Job(
+            id=record.id,
+            status=JobStatus(status_value),
+            progress=record.progress,
+            file_hash=record.file_hash,
+            original_filename=record.original_filename,
+            audio_path=record.audio_path,
+            audio_object_key=record.audio_object_key,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            error=record.error,
+            result=record.result,
+            metrics=record.metrics or {},
+        )
 
     async def create(
         self,
@@ -37,6 +101,7 @@ class JobRepository:
         file_hash: str,
         original_filename: str,
         audio_path: str | None = None,
+        audio_object_key: str | None = None,
     ) -> Job:
         """Create a new job.
 
@@ -49,18 +114,29 @@ class JobRepository:
         Returns:
             The created Job instance.
         """
-        job = Job(
+        now = datetime.utcnow()
+        record = JobRecord(
             id=job_id,
             file_hash=file_hash,
             original_filename=original_filename,
             audio_path=audio_path,
-            status=JobStatus.QUEUED,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            audio_object_key=audio_object_key,
+            status=JobStatus.QUEUED.value,
+            progress=0,
+            created_at=now,
+            updated_at=now,
+            metrics={},
         )
-        await self._save(job)
-        logger.info("Job created", job_id=job_id, file_hash=file_hash[:16])
-        return job
+        try:
+            async with self.session_factory() as session:
+                session.add(record)
+                await session.commit()
+                await session.refresh(record)
+            logger.info("Job created", job_id=job_id, file_hash=file_hash[:16])
+            return self._to_job(record)
+        except Exception as e:
+            logger.error("Failed to create job", job_id=job_id, error=str(e))
+            raise StorageError(f"Failed to create job: {e}", path="jobs")
 
     async def get(self, job_id: str) -> Job:
         """Get a job by ID.
@@ -74,25 +150,18 @@ class JobRepository:
         Raises:
             JobNotFoundError: If job doesn't exist.
         """
-        job_path = self._job_path(job_id)
-        if not job_path.exists():
-            raise JobNotFoundError(job_id)
-
         try:
-            async with aiofiles.open(job_path, encoding="utf-8") as f:
-                content = await f.read()
-                if not content.strip():
-                    raise StorageError("Job file is empty", path=str(job_path))
-                data = json.loads(content)
-                return Job(**data)
-        except json.JSONDecodeError as e:
-            logger.error("Invalid JSON in job file", job_id=job_id, error=str(e))
-            raise StorageError(f"Invalid job data: {e}", path=str(job_path))
-        except StorageError:
+            async with self.session_factory() as session:
+                result = await session.execute(select(JobRecord).where(JobRecord.id == job_id))
+                record = result.scalar_one_or_none()
+                if record is None:
+                    raise JobNotFoundError(job_id)
+                return self._to_job(record)
+        except JobNotFoundError:
             raise
         except Exception as e:
             logger.error("Failed to read job", job_id=job_id, error=str(e))
-            raise StorageError(f"Failed to read job: {e}", path=str(job_path))
+            raise StorageError(f"Failed to read job: {e}", path="jobs")
 
     async def find_by_hash(self, file_hash: str) -> Job | None:
         """Find an existing job by file hash.
@@ -103,26 +172,26 @@ class JobRepository:
         Returns:
             The Job instance if found, None otherwise.
         """
-        for job_file in self.storage_dir.glob("*.json"):
-            try:
-                async with aiofiles.open(job_file, encoding="utf-8") as f:
-                    content = await f.read()
-                    if not content.strip():
-                        continue
-                    data = json.loads(content)
-                    if data.get("file_hash") == file_hash:
-                        job = Job(**data)
-                        # Only return if job completed successfully
-                        if job.status == JobStatus.DONE:
-                            logger.info(
-                                "Found existing job by hash",
-                                job_id=job.id,
-                                file_hash=file_hash[:16],
-                            )
-                            return job
-            except Exception:
-                continue
-        return None
+        try:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(JobRecord)
+                    .where(JobRecord.file_hash == file_hash)
+                    .where(JobRecord.status == JobStatus.DONE.value)
+                    .order_by(JobRecord.created_at.desc())
+                )
+                record = result.scalars().first()
+                if record is None:
+                    return None
+                logger.info(
+                    "Found existing job by hash",
+                    job_id=record.id,
+                    file_hash=file_hash[:16],
+                )
+                return self._to_job(record)
+        except Exception as e:
+            logger.error("Failed to find job by hash", error=str(e))
+            raise StorageError(f"Failed to find job by hash: {e}", path="jobs")
 
     async def update(
         self,
@@ -146,29 +215,45 @@ class JobRepository:
         Returns:
             The updated Job instance.
         """
-        job = await self.get(job_id)
+        try:
+            async with self.session_factory() as session:
+                result_record = await session.execute(
+                    select(JobRecord).where(JobRecord.id == job_id)
+                )
+                record = result_record.scalar_one_or_none()
+                if record is None:
+                    raise JobNotFoundError(job_id)
 
-        if status is not None:
-            job.status = status
-        if progress is not None:
-            job.progress = progress
-        if error is not None:
-            job.error = error
-        if result is not None:
-            job.result = result
-        if metrics is not None:
-            job.metrics.update(metrics)
+                if status is not None:
+                    record.status = status.value
+                if progress is not None:
+                    record.progress = progress
+                if error is not None:
+                    record.error = error
+                if result is not None:
+                    record.result = result
+                if metrics is not None:
+                    current_metrics = record.metrics or {}
+                    current_metrics.update(metrics)
+                    record.metrics = current_metrics
 
-        job.updated_at = datetime.utcnow()
-        await self._save(job)
+                record.updated_at = datetime.utcnow()
+                await session.commit()
+                await session.refresh(record)
 
-        logger.debug(
-            "Job updated",
-            job_id=job_id,
-            status=job.status.value,
-            progress=job.progress,
-        )
-        return job
+                logger.debug(
+                    "Job updated",
+                    job_id=job_id,
+                    status=record.status,
+                    progress=record.progress,
+                )
+                return self._to_job(record)
+
+        except JobNotFoundError:
+            raise
+        except Exception as e:
+            logger.error("Failed to update job", job_id=job_id, error=str(e))
+            raise StorageError(f"Failed to update job: {e}", path="jobs")
 
     async def update_status(self, job_id: str, status: JobStatus) -> Job:
         """Update job status.
@@ -249,10 +334,14 @@ class JobRepository:
         Args:
             job_id: The job identifier.
         """
-        job_path = self._job_path(job_id)
-        if job_path.exists():
-            job_path.unlink()
+        try:
+            async with self.session_factory() as session:
+                await session.execute(delete(JobRecord).where(JobRecord.id == job_id))
+                await session.commit()
             logger.info("Job deleted", job_id=job_id)
+        except Exception as e:
+            logger.error("Failed to delete job", job_id=job_id, error=str(e))
+            raise StorageError(f"Failed to delete job: {e}", path="jobs")
 
     async def find_before(self, cutoff: datetime) -> list[Job]:
         """Find jobs created before a cutoff date.
@@ -263,86 +352,16 @@ class JobRepository:
         Returns:
             List of jobs created before the cutoff.
         """
-        old_jobs: list[Job] = []
-        for job_file in self.storage_dir.glob("*.json"):
-            try:
-                async with aiofiles.open(job_file, encoding="utf-8") as f:
-                    content = await f.read()
-                    if not content.strip():
-                        continue
-                    data = json.loads(content)
-                    job = Job(**data)
-                    if job.created_at < cutoff:
-                        old_jobs.append(job)
-            except Exception:
-                continue
-        return old_jobs
-
-    async def _save(self, job: Job) -> None:
-        """Save a job to disk.
-
-        Args:
-            job: The job to save.
-        """
-        import asyncio
-        import os
-
-        job_path = self._job_path(job.id)
-        temp_path = job_path.with_suffix(".tmp")
-        max_retries = 5
-        retry_delay = 0.1  # Start with 100ms
-
-        for attempt in range(max_retries):
-            try:
-                # Write to temp file first, then rename (atomic operation)
-                async with aiofiles.open(temp_path, mode="w", encoding="utf-8") as f:
-                    await f.write(job.model_dump_json(indent=2))
-                    await f.flush()
-
-                # On Windows, we need to remove the target file first if it exists
-                # because os.replace/Path.replace can fail with PermissionError
-                if os.name == "nt" and job_path.exists():
-                    try:
-                        job_path.unlink()
-                    except PermissionError:
-                        # File is locked, wait and retry
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        continue
-
-                # Atomic rename
-                temp_path.replace(job_path)
-                return  # Success
-
-            except PermissionError as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        "File locked, retrying save",
-                        job_id=job.id,
-                        attempt=attempt + 1,
-                        max_retries=max_retries,
-                    )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    # Clean up temp file if exists
-                    if temp_path.exists():
-                        try:
-                            temp_path.unlink()
-                        except Exception:
-                            pass
-                    logger.error("Failed to save job after retries", job_id=job.id, error=str(e))
-                    raise StorageError(f"Failed to save job: {e}", path=str(job_path))
-
-            except Exception as e:
-                # Clean up temp file if exists
-                if temp_path.exists():
-                    try:
-                        temp_path.unlink()
-                    except Exception:
-                        pass
-                logger.error("Failed to save job", job_id=job.id, error=str(e))
-                raise StorageError(f"Failed to save job: {e}", path=str(job_path))
+        try:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(JobRecord).where(JobRecord.created_at < cutoff)
+                )
+                records = result.scalars().all()
+                return [self._to_job(record) for record in records]
+        except Exception as e:
+            logger.error("Failed to find old jobs", error=str(e))
+            raise StorageError(f"Failed to find old jobs: {e}", path="jobs")
 
 
 # Global repository instance

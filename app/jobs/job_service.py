@@ -14,6 +14,7 @@ from app.core.errors import FileTooLargeError, UnsupportedFormatError, Validatio
 from app.core.logging import get_logger
 from app.jobs.job_models import Job, JobStatus
 from app.jobs.job_repository import JobRepository, job_repository
+from app.storage.minio_storage import MinioStorage, create_minio_storage
 
 if TYPE_CHECKING:
     from app.stt.whisper_engine import WhisperEngine
@@ -43,6 +44,16 @@ class JobService:
         self.summarizer = summarizer
         self.work_dir = settings.AUDIO_WORK_DIR
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.storage: MinioStorage | None
+        if settings.STORAGE_BACKEND == "minio":
+            self.storage = create_minio_storage()
+        else:
+            self.storage = None
+
+    async def init_storage(self) -> None:
+        """Initialize storage backend (e.g., ensure buckets)."""
+        if self.storage is not None:
+            await self.storage.ensure_bucket()
 
     def set_whisper_engine(self, engine: "WhisperEngine") -> None:
         """Set the Whisper engine (called after app startup)."""
@@ -86,12 +97,16 @@ class JobService:
         job_id = str(uuid4())
         audio_path = await self._save_upload(audio_file, job_id)
 
+        # Upload original audio to object storage (if configured)
+        audio_object_key = await self._upload_to_object_storage(audio_path, job_id)
+
         # Create job
         job = await self.repository.create(
             job_id=job_id,
             file_hash=file_hash,
             original_filename=audio_file.filename or "unknown",
             audio_path=str(audio_path),
+            audio_object_key=audio_object_key,
         )
 
         logger.info(
@@ -386,6 +401,24 @@ class JobService:
 
         logger.debug("File saved", job_id=job_id, path=str(file_path))
         return file_path
+
+    async def _upload_to_object_storage(self, file_path: Path, job_id: str) -> str | None:
+        """Upload file to object storage and return object key.
+
+        Args:
+            file_path: Local path to file.
+            job_id: Job identifier.
+
+        Returns:
+            Object key if uploaded, else None.
+        """
+        if self.storage is None:
+            return None
+
+        object_key = f"jobs/{job_id}/original{file_path.suffix.lower()}"
+        await self.storage.save_file(file_path, object_key)
+        logger.info("Uploaded original audio to MinIO", job_id=job_id, object_key=object_key)
+        return object_key
 
 
 # Global service instance

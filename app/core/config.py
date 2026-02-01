@@ -30,6 +30,19 @@ class Settings(BaseSettings):
     JOB_STORAGE_DIR: Path = Path("./data/jobs")
     AUDIO_WORK_DIR: Path = Path("./data/work")
 
+    # Object Storage
+    STORAGE_BACKEND: Literal["local", "minio"] = "minio"
+    MINIO_ENDPOINT: str = "localhost:9000"
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin123"
+    MINIO_BUCKET: str = "voice-summary"
+    MINIO_SECURE: bool = False
+
+    # Database
+    DATABASE_URL: str = (
+        "postgresql+asyncpg://voice_summary:voice_summary_password@localhost:5432/voice_summary"
+    )
+
     # Cleanup
     JOB_RETENTION_DAYS: int = 7
 
